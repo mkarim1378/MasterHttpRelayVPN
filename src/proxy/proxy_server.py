@@ -580,42 +580,19 @@ class ProxyServer:
             return
 
         # ── IP-literal destinations ───────────────────────────────
-        # Prefer a direct tunnel first (works for unblocked IPs and keeps
-        # TLS end-to-end). If the network blocks the route (common for
-        # Telegram data-centers behind DPI), fall back to:
-        #   • port 443 → MITM + relay through Apps Script
-        #   • port 80  → plain-HTTP relay through Apps Script
-        #   • other    → give up (non-HTTP; can't be relayed)
-        # We use a shorter connect timeout for IP literals (4 s) because
-        # when the route is DPI-dropped, waiting longer doesn't help and
-        # clients like Telegram speed up DC-rotation when we fail fast.
-        # We remember per-IP failures for a short while so subsequent
-        # connects skip the doomed direct attempt.
+        # Relay HTTP(S) IP literals through Apps Script (e.g. Telegram DCs on
+        # 443) to bypass DPI that blocks direct routes to those IPs.
+        # Keep non-HTTP ports on direct tunnel because they cannot be relayed.
         if is_ip_literal(host):
-            if not self._direct_temporarily_disabled(host):
-                log.info("Direct tunnel → %s:%d (IP literal)", host, port)
-                ok = await self._do_direct_tunnel(
-                    host, port, reader, writer, timeout=4.0,
-                )
-                if ok:
-                    return
-                self._remember_direct_failure(host, ttl=300)
-                if port not in (80, 443):
-                    log.warning("Direct tunnel failed for %s:%d", host, port)
-                    return
-                log.warning(
-                    "Direct tunnel fallback → %s:%d (switching to relay)",
-                    host, port,
-                )
-            else:
-                log.info(
-                    "Relay fallback → %s:%d (direct temporarily disabled)",
-                    host, port,
-                )
             if port == 443:
                 await self._do_mitm_connect(host, port, reader, writer)
             elif port == 80:
                 await self._do_plain_http_tunnel(host, port, reader, writer)
+            else:
+                log.info("Direct tunnel → %s:%d (IP literal non-HTTP port)", host, port)
+                ok = await self._do_direct_tunnel(host, port, reader, writer)
+                if not ok:
+                    log.warning("Direct tunnel failed for %s:%d", host, port)
             return
 
         override_ip = self._sni_rewrite_ip(host)
@@ -684,7 +661,7 @@ class ProxyServer:
         h = host.lower().rstrip(".")
         if h == "music.youtube.com" or h.endswith(".music.youtube.com"):
             return None
-            
+
         ip = self._hosts_ip(host)
         if ip:
             return ip

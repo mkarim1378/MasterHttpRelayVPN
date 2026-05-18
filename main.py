@@ -282,7 +282,6 @@ def main():
         if listen_host == "127.0.0.1":
             config["listen_host"] = "0.0.0.0"
             listen_host = "0.0.0.0"
-            log.info("LAN sharing enabled — listening on all interfaces")
 
     # If either explicit LAN sharing is enabled or we bind to all interfaces,
     # print concrete IPv4 addresses users can use on other devices.

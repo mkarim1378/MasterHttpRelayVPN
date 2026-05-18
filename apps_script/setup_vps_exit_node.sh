@@ -202,7 +202,7 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-PUBLIC_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || echo "YOUR-VPS-IP")
+PUBLIC_IP=$(curl -sf --max-time 5 https://ipv4.ifconfig.me 2>/dev/null || echo "YOUR-VPS-IP")
 
 echo ""
 echo -e "${BOLD}${GREEN}============================================================${NC}"

@@ -14,6 +14,7 @@ import codecs
 import hashlib
 import json
 import logging
+import random
 import re
 import socket
 import ssl
@@ -38,6 +39,9 @@ from core.constants import (
     POOL_MIN_IDLE,
     RELAY_TIMEOUT,
     SCRIPT_BLACKLIST_TTL,
+    SCRIPT_PROBE_INTERVAL_MAX,
+    SCRIPT_PROBE_INTERVAL_MIN,
+    SCRIPT_PROBE_TIMEOUT,
     SEMAPHORE_MAX,
     STATEFUL_HEADER_NAMES,
     STATIC_EXTS,
@@ -59,6 +63,7 @@ from .fronting_support import (
     validate_range_response,
 )
 from .relay_response import (
+    classify_relay_envelope,
     classify_relay_error,
     error_response,
     extract_apps_script_user_html,
@@ -88,6 +93,32 @@ def _mask_sid(sid: str) -> str:
     return f"{sid[:6]}\u2026{sid[-4:]}"
 
 
+class ScriptDeploymentError(Exception):
+    """Internal signal that a permanent Apps Script envelope was detected.
+
+    Raised by per-SID parse hooks (``_relay_single_h2_with_sid``,
+    ``_relay_single_h2``, ``_relay_single``, ``_parse_batch_body``) when
+    :func:`relay_response.classify_relay_envelope` returns a permanent
+    category (``"quota" | "auth" | "deploy" | "admin"``).  Caught by
+    ``_relay_fanout`` and ``_relay_with_retry`` so the corresponding
+    script ID is dropped from rotation via ``_blacklist_sid`` and the
+    next attempt picks a different deployment.  Never propagates to
+    client code paths — the relay always converts it back into a normal
+    response (a healthy racer's bytes, a retry result, or an upstream
+    502) before returning to callers outside this module.
+    """
+
+    def __init__(self, sid: str, category: str, raw: str):
+        self.sid = sid
+        self.category = category
+        self.raw = raw
+        super().__init__(f"ScriptDeploymentError(sid={_mask_sid(sid)}, "
+                         f"category={category}, raw={raw[:120]!r})")
+
+    def __str__(self) -> str:
+        return f"{self.category}: {self.raw[:120]}"
+
+
 class DomainFronter:
     _STATIC_EXTS = STATIC_EXTS
     _H2_FAILURE_COOLDOWN = 15.0   # reduced: DPI token bucket refills in ~8-10s
@@ -110,6 +141,8 @@ class DomainFronter:
         "sec-fetch-site",
     )
     _SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
+    _EXIT_NODE_BYPASS_SUFFIXES = ("googlevideo.com",)
+    _APPS_SCRIPT_DEFAULT_LANG = "en"
 
     def __init__(self, config: dict):
         self.connect_host = config.get("google_ip", "216.239.38.120")
@@ -127,7 +160,10 @@ class DomainFronter:
         self._script_ids = script if isinstance(script, list) else [script]
         self._script_idx = 0
         self.script_id = self._script_ids[0]  # backward compat / logging
-        self._dev_available = False  # True if /dev endpoint works (no redirect, ~400ms faster)
+        self._dev_available = False  # Always False — /exec is used exclusively
+        self._apps_script_lang = str(
+            config.get("apps_script_lang", self._APPS_SCRIPT_DEFAULT_LANG)
+        ).strip().lower() or self._APPS_SCRIPT_DEFAULT_LANG
 
         # Simple execution monitor: log total consumed Apps Script executions.
         self._execution_report_interval = 5.0
@@ -146,6 +182,8 @@ class DomainFronter:
                                           len(self._script_ids)))
         self._sid_blacklist: dict[str, float] = {}
         self._blacklist_ttl = SCRIPT_BLACKLIST_TTL
+        self._probe_task: asyncio.Task | None = None
+        self._probe_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
 
         # Per-host stats (requests, cache hits, bytes, cumulative latency).
         self._per_site: dict[str, HostStat] = {}
@@ -628,10 +666,13 @@ class DomainFronter:
         payload = json.dumps(
             {"m": "GET", "u": "http://example.com/", "k": self.auth_key}
         ).encode()
+        path = f"/macros/s/{sid}/exec?hl={self._apps_script_lang}"
         request = (
-            f"POST /macros/s/{sid}/exec HTTP/1.1\r\n"
+            f"POST {path} HTTP/1.1\r\n"
             f"Host: {self.http_host}\r\n"
             "Content-Type: application/json\r\n"
+            "Accept: application/json,text/plain,*/*\r\n"
+            "Accept-Language: en-US,en;q=0.9\r\n"
             f"Content-Length: {len(payload)}\r\n"
             "Connection: close\r\n\r\n"
         ).encode() + payload
@@ -767,6 +808,119 @@ class DomainFronter:
         for sid, until in list(self._sid_blacklist.items()):
             if force or until <= now:
                 self._sid_blacklist.pop(sid, None)
+
+    async def _probe_one_sid(self, sid: str) -> None:
+        """Re-validate a blacklisted SID with one low-cost relay request.
+
+        Healthy → drop from `_sid_blacklist` and log recovery.
+        Permanent envelope or transport error → leave blacklisted, no TTL change.
+        Never propagates exceptions to client paths (2.10).
+        """
+        payload = {"m": "GET", "u": "http://example.com/", "k": self.auth_key}
+        body_bytes = json.dumps(payload).encode()
+        path = self._exec_path_for_sid(sid)
+        async with self._probe_semaphore:
+            try:
+                # Probe also consumes Apps Script quota — record it.
+                self._record_execution(sid)
+                transport = self._pick_h2() or self._h2
+                if transport is None:
+                    # No H2 transport available — skip this probe cycle. The
+                    # H1 fallback path is intentionally not used here so a
+                    # saturated client semaphore can't starve probes.
+                    return
+                status, headers, body = await asyncio.wait_for(
+                    transport.request(
+                        method="POST", path=path, host=self.http_host,
+                        headers=self._apps_script_headers(),
+                        body=body_bytes,
+                        timeout=SCRIPT_PROBE_TIMEOUT,
+                    ),
+                    timeout=SCRIPT_PROBE_TIMEOUT,
+                )
+            except Exception as exc:
+                log.debug("Probe %s failed (%s) — keeping blacklisted",
+                          _mask_sid(sid), exc)
+                return
+
+        category, _raw = classify_relay_envelope(body)
+        if category is not None:
+            log.debug("Probe %s still %s — keeping blacklisted",
+                      _mask_sid(sid), category)
+            return
+
+        # Healthy — recover.
+        self._sid_blacklist.pop(sid, None)
+        log.info("Re-validated script %s — recovered", _mask_sid(sid))
+
+    async def _probe_tick(self) -> None:
+        """One pass of the probe loop — re-validate every still-blacklisted SID.
+
+        No-op when only one script ID is configured (3.7) or when the
+        blacklist is empty (3.8).
+        """
+        if len(self._script_ids) <= 1:
+            return
+        sids = [s for s in list(self._sid_blacklist)
+                if self._is_sid_blacklisted(s)]
+        if not sids:
+            return
+        await asyncio.gather(
+            *(self._probe_one_sid(s) for s in sids),
+            return_exceptions=True,
+        )
+
+    async def _probe_blacklisted_sids(self) -> None:
+        """Background loop: every uniform(MIN, MAX) seconds re-probe blacklisted SIDs."""
+        while True:
+            try:
+                interval = random.uniform(
+                    SCRIPT_PROBE_INTERVAL_MIN, SCRIPT_PROBE_INTERVAL_MAX,
+                )
+                await asyncio.sleep(interval)
+                await self._probe_tick()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.debug("Probe loop error: %s", exc)
+
+    def _is_failed_relay_result(self, sid: str, result: bytes) -> bool:
+        """Return True if a successful racer's bytes are actually an Apps
+        Script permanent-failure envelope (or a 502 synthesised from one).
+
+        The parse-site hooks in ``_relay_single_h2_with_sid`` /
+        ``_relay_single_h2`` / ``_relay_single`` / ``_parse_batch_body``
+        normally raise :class:`ScriptDeploymentError` before ``_relay_fanout``
+        ever sees the body, so this inspection is a defence-in-depth check
+        against bypass paths (test monkeypatches that replace
+        ``_relay_single_h2_with_sid`` directly, future refactors that
+        remove the per-SID hook). When this returns True the caller
+        blacklists the SID (idempotent if already done by the parse hook)
+        and keeps waiting on the remaining racers instead of forwarding
+        the 502 to the client (requirement 2.4).
+        """
+        # Case 1: caller bypassed the parse hook and handed back the raw
+        # Apps Script envelope. classify_relay_envelope decides whether
+        # the envelope error is permanent (quota/auth/deploy/admin) or
+        # transient/healthy.
+        category, _raw = classify_relay_envelope(result)
+        if category is not None:
+            if not self._is_sid_blacklisted(sid):
+                self._blacklist_sid(sid, reason=category)
+            return True
+        # Case 2: caller bypassed the parse hook but already invoked
+        # parse_relay_response, so the original envelope has been
+        # replaced by a synthesised ``HTTP/1.1 502`` response. Without
+        # the JSON envelope we cannot distinguish permanent from
+        # transient classes, but in fan-out we always prefer to keep
+        # waiting on the remaining racers rather than forward a 502 —
+        # if every racer ends up here we still surface the last
+        # exception via ``winner_exc``.
+        if result.startswith(b"HTTP/1.1 502"):
+            if not self._is_sid_blacklisted(sid):
+                self._blacklist_sid(sid, reason="parsed_502")
+            return True
+        return False
 
     def _pick_fanout_sids(self, key: str | None) -> list[str]:
         """Pick up to `parallel_relay` distinct non-blacklisted script IDs.
@@ -982,8 +1136,18 @@ class DomainFronter:
         return self._exec_path_for_sid(sid)
 
     def _exec_path_for_sid(self, sid: str) -> str:
-        """Build the /macros/s/<sid>/(dev|exec) path for a specific script ID."""
-        return f"/macros/s/{sid}/{'dev' if self._dev_available else 'exec'}"
+        """Build the /macros/s/<sid>/exec path for a specific script ID."""
+        # Always use /exec (production endpoint). /dev is a test-deployment path
+        # with unstable auth/latency behaviour and is not used in production.
+        return f"/macros/s/{sid}/exec?hl={self._apps_script_lang}"
+
+    def _apps_script_headers(self) -> dict[str, str]:
+        """Headers for Apps Script relay calls (control-plane, not target origin)."""
+        return {
+            "content-type": "application/json",
+            "accept": "application/json,text/plain,*/*",
+            "accept-language": "en-US,en;q=0.9",
+        }
     async def _flush_pool(self):
         """Close all pooled connections (they may be stale after errors)."""
         async with self._pool_lock:
@@ -1073,6 +1237,8 @@ class DomainFronter:
                 and len(self._exit_node_urls) >= 1
                 and self._exit_node_health_task is None):
             self._exit_node_health_task = self._spawn(self._exit_node_health_loop())
+        if self._probe_task is None:
+            self._probe_task = self._spawn(self._probe_blacklisted_sids())
         # Start H2 connection (runs alongside H1 pool)
         if self._h2:
             self._spawn(self._h2_connect_and_warm())
@@ -1118,6 +1284,7 @@ class DomainFronter:
         self._maintenance_task = None
         self._stats_task = None
         self._execution_task = None
+        self._probe_task = None
         self._keepalive_task = None
         self._exit_node_health_task = None
 
@@ -1174,38 +1341,15 @@ class DomainFronter:
             self._keepalive_task = self._spawn(self._keepalive_loop())
 
     async def _prewarm_script(self):
-        """Pre-warm Apps Script and detect /dev fast path (no redirect)."""
+        """Pre-warm Apps Script via /exec."""
         payload = json.dumps(
             {"m": "GET", "u": "http://example.com/", "k": self.auth_key}
         ).encode()
-        hdrs = {"content-type": "application/json"}
+        hdrs = self._apps_script_headers()
         sid = self._script_ids[0]
 
-        # Test /dev endpoint — returns data inline (no 302 redirect).
-        # If it works, saves ~400ms per request by eliminating one round trip.
         try:
-            dev_path = f"/macros/s/{sid}/dev"
-            t0 = time.perf_counter()
-            self._record_execution(sid)
-            status, _, body = await asyncio.wait_for(
-                self._h2.request(
-                    method="POST", path=dev_path, host=self.http_host,
-                    headers=hdrs, body=payload,
-                ),
-                timeout=15,
-            )
-            dt = (time.perf_counter() - t0) * 1000
-            data = load_relay_json(body.decode(errors="replace"))
-            if "s" in data:
-                self._dev_available = True
-                log.info("/dev fast path active (%.0fms, no redirect)", dt)
-                return
-        except Exception as e:
-            log.debug("/dev test failed: %s", e)
-
-        # Fallback: warm up with /exec
-        try:
-            exec_path = f"/macros/s/{sid}/exec"
+            exec_path = f"/macros/s/{sid}/exec?hl={self._apps_script_lang}"
             t0 = time.perf_counter()
             self._record_execution(sid)
             await asyncio.wait_for(
@@ -1216,7 +1360,7 @@ class DomainFronter:
                 timeout=15,
             )
             dt = (time.perf_counter() - t0) * 1000
-            log.info("Apps Script pre-warmed in %.0fms", dt)
+            log.info("Apps Script pre-warmed via /exec in %.0fms", dt)
         except Exception as e:
             log.debug("Pre-warm failed: %s", e)
 
@@ -1271,7 +1415,7 @@ class DomainFronter:
                 await asyncio.wait_for(
                     self._h2.request(
                         method="POST", path=path, host=self.http_host,
-                        headers={"content-type": "application/json"},
+                        headers=self._apps_script_headers(),
                         body=json.dumps(payload).encode(),
                     ),
                     timeout=20,
@@ -1563,12 +1707,17 @@ class DomainFronter:
         """Return True if this URL should be routed through the exit node."""
         if not self._exit_node_enabled or not self._exit_node_url:
             return False
-        if self._exit_node_mode == "full":
-            return True
-        # selective: check if destination hostname matches configured list
         host = self._host_key(url)
         if not host:
             return False
+        # googlevideo flows are large/CPU-heavy; keep them on direct Google relay
+        # and never chain through Cloudflare/Deno/VPS exit nodes.
+        if any(host == suffix or host.endswith("." + suffix)
+               for suffix in self._EXIT_NODE_BYPASS_SUFFIXES):
+            return False
+        if self._exit_node_mode == "full":
+            return True
+        # selective: check if destination hostname matches configured list
         for pattern in self._exit_node_hosts:
             if host == pattern or host.endswith("." + pattern):
                 return True
@@ -2758,9 +2907,26 @@ class DomainFronter:
                     exc = t.exception()
                     if exc is None:
                         winner_result = t.result()
+                        if self._is_failed_relay_result(sid, winner_result):
+                            # Defence-in-depth: the per-SID parse hook
+                            # normally raises ScriptDeploymentError before
+                            # we get here, but a bypass path (test
+                            # monkeypatch on _relay_single_h2_with_sid,
+                            # future refactor) could still surface a
+                            # permanent envelope as a "successful" body.
+                            # Treat this racer as failed and keep waiting
+                            # on the remaining racers (requirement 2.4).
+                            winner_exc = RuntimeError(
+                                f"fan-out racer {_mask_sid(sid)} "
+                                f"returned permanent envelope"
+                            )
+                            continue
                         return winner_result
-                    # This racer failed — blacklist and keep waiting for others
-                    self._blacklist_sid(sid, reason=type(exc).__name__)
+                    # This racer failed — blacklist (unless the parse
+                    # hook already did with a sharper category reason)
+                    # and keep waiting for others (requirement 3.3).
+                    if not isinstance(exc, ScriptDeploymentError):
+                        self._blacklist_sid(sid, reason=type(exc).__name__)
                     winner_exc = exc
             # All racers failed
             if winner_exc is not None:
@@ -2790,7 +2956,7 @@ class DomainFronter:
         t0 = time.perf_counter()
         status, headers, body = await (self._pick_h2() or self._h2).request(
             method="POST", path=path, host=self.http_host,
-            headers={"content-type": "application/json"},
+            headers=self._apps_script_headers(),
             body=json_body,
             timeout=self._relay_timeout,
         )
@@ -2802,6 +2968,11 @@ class DomainFronter:
                 (time.perf_counter() - t0) * 1000.0,
                 len(body),
             )
+
+        category, raw = classify_relay_envelope(body)
+        if category is not None:
+            self._blacklist_sid(sid, reason=category)
+            raise ScriptDeploymentError(sid, category, raw)
 
         return parse_relay_response(body, self._max_response_body_bytes)
 
@@ -2821,10 +2992,15 @@ class DomainFronter:
 
         status, headers, body = await (self._pick_h2() or self._h2).request(
             method="POST", path=path, host=self.http_host,
-            headers={"content-type": "application/json"},
+            headers=self._apps_script_headers(),
             body=json_body,
             timeout=self._relay_timeout,
         )
+
+        category, raw = classify_relay_envelope(body)
+        if category is not None:
+            self._blacklist_sid(sid, reason=category)
+            raise ScriptDeploymentError(sid, category, raw)
 
         return parse_relay_response(body, self._max_response_body_bytes)
 
@@ -2859,6 +3035,8 @@ class DomainFronter:
             request_lines = [
                 f"{redirect_method} {rpath} HTTP/1.1",
                 f"Host: {parsed.netloc}",
+                "Accept: application/json,text/plain,*/*",
+                "Accept-Language: en-US,en;q=0.9",
                 "Accept-Encoding: gzip",
                 "Connection: keep-alive",
             ]
@@ -2888,6 +3066,8 @@ class DomainFronter:
                 f"POST {path} HTTP/1.1\r\n"
                 f"Host: {self.http_host}\r\n"
                 f"Content-Type: application/json\r\n"
+                f"Accept: application/json,text/plain,*/*\r\n"
+                f"Accept-Language: en-US,en;q=0.9\r\n"
                 f"Content-Length: {len(json_body)}\r\n"
                 f"Accept-Encoding: gzip\r\n"
                 f"Connection: keep-alive\r\n"
@@ -2905,7 +3085,6 @@ class DomainFronter:
             )
 
             await self._release(reader, writer, created)
-            return parse_relay_response(resp_body, self._max_response_body_bytes)
 
         except Exception:
             try:
@@ -2913,6 +3092,13 @@ class DomainFronter:
             except Exception:
                 pass
             raise
+
+        category, raw = classify_relay_envelope(resp_body)
+        if category is not None:
+            self._blacklist_sid(sid, reason=category)
+            raise ScriptDeploymentError(sid, category, raw)
+
+        return parse_relay_response(resp_body, self._max_response_body_bytes)
 
     async def _relay_batch(self, payloads: list[dict]) -> list[bytes]:
         """Send multiple requests in one POST using Apps Script fetchAll."""
@@ -2940,7 +3126,7 @@ class DomainFronter:
                 status, headers, body = await asyncio.wait_for(
                     (self._pick_h2() or self._h2).request(
                         method="POST", path=path, host=self.http_host,
-                        headers={"content-type": "application/json"},
+                        headers=self._apps_script_headers(),
                         body=json_body,
                         timeout=batch_timeout,
                     ),
@@ -2954,7 +3140,7 @@ class DomainFronter:
                         len(body),
                     )
                 self._record_h2_success()
-                return self._parse_batch_body(body, payloads)
+                return self._parse_batch_body(body, payloads, sid)
             except Exception as e:
                 if self._is_h2_transport_error(e):
                     self._record_h2_failure(e)
@@ -2994,11 +3180,23 @@ class DomainFronter:
                     pass
                 raise
 
-        return self._parse_batch_body(resp_body, payloads)
+        return self._parse_batch_body(resp_body, payloads, sid)
 
     def _parse_batch_body(self, resp_body: bytes,
-                          payloads: list[dict]) -> list[bytes]:
+                          payloads: list[dict],
+                          sid: str) -> list[bytes]:
         """Parse a batch response body into individual results."""
+        # Classify the *outer* batch envelope before per-item parsing.
+        # A permanent error here ("e" at the top level) means the
+        # deployment itself failed the whole batch — blacklist the SID
+        # and raise so _relay_with_retry can pick a different one.
+        # Per-item "e" fields below are target-origin errors and stay
+        # untouched (requirement 3.6).
+        category, raw = classify_relay_envelope(resp_body)
+        if category is not None:
+            self._blacklist_sid(sid, reason=category)
+            raise ScriptDeploymentError(sid, category, raw)
+
         text = resp_body.decode(errors="replace").strip()
         # Apps Script can wrap JSON inside an HTML shell; reuse the same
         # robust loader used by single-response parsing.
