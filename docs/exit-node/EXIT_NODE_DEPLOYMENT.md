@@ -1,4 +1,4 @@
-# Exit Node Deployment Guide (Cloudflare / VPS)
+# Exit Node Deployment Guide (Cloudflare / val.town / VPS)
 
 This guide explains how to deploy an exit node for MasterHttpRelayVPN on free platforms or your own VPS server.
 
@@ -11,6 +11,7 @@ Use this when destinations block Google datacenter egress.
 ## 1) Choose One Provider
 
 - Cloudflare Workers (free tier available)
+- **val.town** (free, no account required beyond sign-up)
 - **Your Own VPS** (full control, Linux server — automated installer included)
 
 You only need one provider.
@@ -40,7 +41,40 @@ Steps:
 6. Deploy.
 7. Copy URL, usually like https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev
 
-## 4) Deploy On Your Own VPS  (Linux only)
+## 4) Deploy On val.town (Free, No Server Needed)
+
+Source file: `apps_script/valtown.ts`
+
+Steps:
+1. Sign in at https://val.town
+2. Click **New Val** and select **HTTP** type.
+3. Paste the full content of `apps_script/valtown.ts`.
+4. Find the first line and set a strong secret:
+   ```ts
+   const PSK = "CHANGE_ME_TO_A_STRONG_SECRET";
+   ```
+5. Save. Your endpoint URL will look like: `https://YOUR-USERNAME--VALNAME.web.val.run`
+
+Configure in `config.json`:
+```json
+"exit_node": {
+  "enabled": true,
+  "provider": "valtown",
+  "url": "https://YOUR-USERNAME--VALNAME.web.val.run",
+  "psk": "CHANGE_ME_TO_A_STRONG_SECRET",
+  "mode": "selective",
+  "hosts": [
+    "chatgpt.com",
+    "openai.com",
+    "claude.ai",
+    "anthropic.com"
+  ]
+}
+```
+
+Note: val.town free tier has a daily request limit. Use `mode: "selective"` to limit traffic to only the sites that need it.
+
+## 5) Deploy On Your Own VPS  (Linux only)
 
 Source files:
 - `apps_script/vps_exit_node.py`  — the relay server
@@ -108,6 +142,7 @@ For your own VPS:
 
 Provider values:
 - `cloudflare`
+- `valtown`
 - `vps`
 
 If `mode` is `selective`, only hosts listed in `hosts` use the exit node.

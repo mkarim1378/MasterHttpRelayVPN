@@ -1,7 +1,20 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import sys; sys.path.insert\\(0,'src'\\); import relay.domain_fronter; import proxy.proxy_server; print\\('Full import OK'\\)\")"
+      "Bash(python -c \"import sys; sys.path.insert\\(0,'src'\\); import relay.domain_fronter; import proxy.proxy_server; print\\('Full import OK'\\)\")",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" diff upstream/python_testing HEAD --stat)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" diff upstream/python_testing HEAD -- .gitignore)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" rm -r --cached .claude/)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" restore --staged .gitignore)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" restore .gitignore)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" checkout HEAD -- .gitignore)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" status)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" restore --staged .claude/)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" log --oneline feature/exit-node-health-check ^upstream/python_testing)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" show a80dc73 --stat)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" diff upstream/python_testing HEAD -- config.example.json README.md)",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" diff upstream/python_testing HEAD -- \"*.py\")",
+      "Bash(git -C \"d:/Github/MasterHttpRelayVPN\" diff upstream/python_testing HEAD -- \"docs/\" \"README.md\")"
     ]
   }
 }

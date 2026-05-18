@@ -1576,8 +1576,11 @@ class DomainFronter:
         return True
 
     def _record_exit_node_success(self, url: str) -> None:
-        was_failed = bool(self._exit_node_failures.get(url, 0)
-                          or self._exit_node_dead_until.get(url, 0.0))
+        now = time.time()
+        was_failed = (
+            bool(self._exit_node_failures.get(url, 0))
+            or self._exit_node_dead_until.get(url, 0.0) > now
+        )
         self._exit_node_failures.pop(url, None)
         self._exit_node_dead_until.pop(url, None)
 
