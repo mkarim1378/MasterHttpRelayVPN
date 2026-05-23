@@ -95,6 +95,11 @@ def parse_args():
         help="Skip the certificate installation check on startup.",
     )
     parser.add_argument(
+        "--skip-captive-check",
+        action="store_true",
+        help="Skip the captive portal detection probe on startup.",
+    )
+    parser.add_argument(
         "--scan",
         action="store_true",
         help="Scan Google IPs to find the fastest reachable one and exit.",
@@ -191,6 +196,8 @@ def main():
         config["log_level"] = args.log_level
     elif os.environ.get("DFT_LOG_LEVEL"):
         config["log_level"] = os.environ["DFT_LOG_LEVEL"]
+
+    config["_skip_captive_check"] = args.skip_captive_check
 
     for key in ("auth_key",):
         if key not in config:
@@ -305,10 +312,30 @@ async def _run(config):
     loop = asyncio.get_running_loop()
     _log = logging.getLogger("asyncio")
     loop.set_exception_handler(_make_exception_handler(_log))
+
+    # ── Captive portal check ───────────────────────────────────────
+    skip_captive = config.get("_skip_captive_check", False)
+    cp_cfg = config.get("captive_portal") or {}
+    captive_enabled = cp_cfg.get("enabled", True)
+
+    if not skip_captive and captive_enabled:
+        from core.captive_portal import startup_check, monitor as captive_monitor
+        await startup_check(config)
+    # ──────────────────────────────────────────────────────────────
+
     server = ProxyServer(config)
+    monitor_task = None
     try:
+        if not skip_captive and captive_enabled:
+            monitor_task = asyncio.create_task(captive_monitor(config))
         await server.start()
     finally:
+        if monitor_task is not None:
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
         await server.stop()
         # Cancel any tasks that leaked through (e.g. fire-and-forget pool tasks).
         stray = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]

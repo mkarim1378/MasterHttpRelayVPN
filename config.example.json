@@ -95,5 +95,10 @@
 			"example.com",
 			"example.org"
 		]
+	},
+	"captive_portal": {
+		"enabled": true,
+		"open_browser": false,
+		"check_interval": 30
 	}
 }
