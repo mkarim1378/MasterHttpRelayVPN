@@ -85,6 +85,11 @@
 	],
 	"youtube_via_relay": false,
 	"hosts": {},
+	"disk_cache": {
+		"enabled": false,
+		"max_mb": 200,
+		"dir": ""
+	},
 	"exit_node": {
 		"enabled": false,
 		"provider": "cloudflare",

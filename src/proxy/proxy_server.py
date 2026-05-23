@@ -87,6 +87,25 @@ class ProxyServer:
         self.fronter = DomainFronter(config)
         self.mitm = None
         self._cache = ResponseCache(max_mb=CACHE_MAX_MB)
+
+        # ── Disk cache (L2, optional) — persists across restarts ───────────
+        _dc_cfg = config.get("disk_cache") or {}
+        self._disk_cache = None
+        if _dc_cfg.get("enabled", False):
+            try:
+                import pathlib as _pathlib
+                from core.disk_cache import DiskCache as _DiskCache
+                _default_dir = str(
+                    _pathlib.Path(__file__).resolve().parent.parent.parent / "http_cache"
+                )
+                _cache_dir = _dc_cfg.get("dir") or _default_dir
+                _max_mb = max(10, int(_dc_cfg.get("max_mb", 200)))
+                self._disk_cache = _DiskCache(_cache_dir, max_mb=_max_mb)
+                self._disk_cache.evict()
+            except Exception as _exc:
+                log.warning("Disk cache init failed: %s — disk caching disabled", _exc)
+        # ───────────────────────────────────────────────────────────────────
+
         self._direct_fail_until: dict[str, float] = {}
         self._servers: list[asyncio.base_events.Server] = []
         self._client_tasks: set[asyncio.Task] = set()
@@ -998,12 +1017,19 @@ class ProxyServer:
                 if await self._maybe_stream_download(method, url, headers, body, writer):
                     continue
 
-                # Check local cache first (GET only)
+                # Check local cache first (GET only) — L1 memory, L2 disk
                 response = None
                 if self._cache_allowed(method, url, headers, body):
                     response = self._cache.get(url)
                     if response:
-                        log.debug("Cache HIT: %s", url[:60])
+                        log.debug("Cache HIT (mem): %s", url[:60])
+                    elif self._disk_cache is not None:
+                        response = self._disk_cache.get(url)
+                        if response:
+                            log.debug("Cache HIT (disk): %s", url[:60])
+                            mem_ttl = ResponseCache.parse_ttl(response, url)
+                            if mem_ttl > 0:
+                                self._cache.put(url, response, mem_ttl)
 
                 if response is None:
                     # Relay through Apps Script
@@ -1019,11 +1045,13 @@ class ProxyServer:
                             b"\r\n" + err_body
                         )
 
-                    # Cache successful GET responses
+                    # Cache successful GET responses in both L1 and L2
                     if self._cache_allowed(method, url, headers, body) and response:
                         ttl = ResponseCache.parse_ttl(response, url)
                         if ttl > 0:
                             self._cache.put(url, response, ttl)
+                            if self._disk_cache is not None:
+                                self._disk_cache.put(url, response, ttl)
                             log.debug("Cached (%ds): %s", ttl, url[:60])
 
                 # Inject permissive CORS headers whenever the browser sent
@@ -1176,20 +1204,29 @@ class ProxyServer:
         if await self._maybe_stream_download(method, url, headers, body, writer):
             return
 
-        # Cache check for GET
+        # Cache check for GET — L1 memory, L2 disk
         response = None
         if self._cache_allowed(method, url, headers, body):
             response = self._cache.get(url)
             if response:
-                log.debug("Cache HIT (HTTP): %s", url[:60])
+                log.debug("Cache HIT (mem, HTTP): %s", url[:60])
+            elif self._disk_cache is not None:
+                response = self._disk_cache.get(url)
+                if response:
+                    log.debug("Cache HIT (disk, HTTP): %s", url[:60])
+                    mem_ttl = ResponseCache.parse_ttl(response, url)
+                    if mem_ttl > 0:
+                        self._cache.put(url, response, mem_ttl)
 
         if response is None:
             response = await self._relay_smart(method, url, headers, body)
-            # Cache successful GET
+            # Cache successful GET in both L1 and L2
             if self._cache_allowed(method, url, headers, body) and response:
                 ttl = ResponseCache.parse_ttl(response, url)
                 if ttl > 0:
                     self._cache.put(url, response, ttl)
+                    if self._disk_cache is not None:
+                        self._disk_cache.put(url, response, ttl)
 
         if origin and response:
             response = inject_cors_headers(response, origin)

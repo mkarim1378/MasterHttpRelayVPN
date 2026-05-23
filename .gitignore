@@ -37,3 +37,5 @@ domainfront_certs_*/
 
 # Local scripts (excluded from git pushes)
 scripts/
+adblock_cache
+http_cache/
